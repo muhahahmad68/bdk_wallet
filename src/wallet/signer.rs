@@ -112,7 +112,7 @@ use miniscript::{SigType, ToPublicKey};
 
 use super::utils::SecpCtx;
 use crate::descriptor::{DescriptorMeta, XKeyUtils};
-use crate::psbt::{PsbtUtils, validated_non_witness_prevout};
+use crate::psbt::{InputPrevout, PrevoutError, PsbtUtils};
 use crate::types::IndexOutOfBoundsError;
 use crate::wallet::error::MiniscriptPsbtError;
 
@@ -151,6 +151,8 @@ pub enum SignerError {
     UserCanceled,
     /// Input index is out of range
     InputIndexOutOfRange(IndexOutOfBoundsError),
+    /// The PSBT input's previous output could not be resolved or is inconsistent
+    InvalidPsbt(PrevoutError),
     /// The `non_witness_utxo` field of the transaction is required to sign this input
     MissingNonWitnessUtxo,
     /// The `non_witness_utxo` specified is invalid
@@ -191,6 +193,7 @@ impl fmt::Display for SignerError {
             ),
             Self::UserCanceled => write!(f, "The user canceled the operation"),
             Self::InputIndexOutOfRange(err) => write!(f, "{err}"),
+            Self::InvalidPsbt(err) => write!(f, "Invalid PSBT: {err}"),
             Self::MissingNonWitnessUtxo => write!(f, "Missing non-witness UTXO"),
             Self::InvalidNonWitnessUtxo => write!(f, "Invalid non-witness UTXO"),
             Self::MissingWitnessUtxo => write!(f, "Missing witness UTXO"),
@@ -212,6 +215,12 @@ impl fmt::Display for SignerError {
 impl From<IndexOutOfBoundsError> for SignerError {
     fn from(err: IndexOutOfBoundsError) -> Self {
         Self::InputIndexOutOfRange(err)
+    }
+}
+
+impl From<PrevoutError> for SignerError {
+    fn from(err: PrevoutError) -> Self {
+        Self::InvalidPsbt(err)
     }
 }
 
@@ -476,26 +485,21 @@ impl InputSigner for SignerWrapper<PrivateKey> {
             return Ok(());
         }
 
-        let outpoint = psbt.unsigned_tx.input[input_index].previous_output;
+        let txin = &psbt.unsigned_tx.input[input_index];
         if input.non_witness_utxo.is_some() {
-            let prevout = validated_non_witness_prevout(input, outpoint)
-                .ok_or(SignerError::InvalidNonWitnessUtxo)?;
-            if input
-                .witness_utxo
-                .as_ref()
-                .is_some_and(|witness| witness != prevout)
-            {
-                return Err(SignerError::InvalidNonWitnessUtxo);
-            }
+            // Validates txid/vout against the outpoint and, if present, agreement with
+            // `witness_utxo`.
+            InputPrevout::new(None, txin, input).map_err(|_| SignerError::InvalidNonWitnessUtxo)?;
         } else if !sign_options.trust_witness_utxo && input.witness_utxo.is_some() {
+            // No tx graph access here, so a merely-claimed `witness_utxo` counts as proof of
+            // P2TR-ness for the exemption — Taproot inputs aren't expected to carry a
+            // `non_witness_utxo` anyway.
             let all_inputs_p2tr =
                 psbt.inputs
                     .iter()
                     .zip(psbt.unsigned_tx.input.iter())
                     .all(|(inp, txin)| {
-                        validated_non_witness_prevout(inp, txin.previous_output)
-                            .or(inp.witness_utxo.as_ref())
-                            .is_some_and(|txout| txout.script_pubkey.is_p2tr())
+                        InputPrevout::new(None, txin, inp).is_ok_and(|prevout| prevout.is_p2tr())
                     });
             if !all_inputs_p2tr {
                 return Err(SignerError::MissingNonWitnessUtxo);

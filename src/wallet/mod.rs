@@ -69,7 +69,7 @@ use crate::descriptor::{
     Policy, XKeyUtils, calc_checksum, check_wallet_descriptor, error::Error as DescriptorError,
     policy::BuildSatisfaction,
 };
-use crate::psbt::{PsbtUtils, validated_non_witness_prevout};
+use crate::psbt::{InputPrevout, PsbtUtils, validated_non_witness_prevout};
 use crate::types::*;
 use crate::wallet::{
     coin_selection::{DefaultCoinSelectionAlgorithm, Excess, InsufficientFunds},
@@ -1892,19 +1892,34 @@ impl Wallet {
         self.update_psbt_with_descriptor(psbt)
             .map_err(SignerError::MiniscriptPsbt)?;
 
-        if !sign_options.trust_witness_utxo {
-            let inputs = psbt.inputs.iter().zip(psbt.unsigned_tx.input.iter());
-            let all_taproot = inputs
-                .clone()
-                .all(|(input, txin)| self.is_verified_taproot_input(input, txin.previous_output));
+        let prevouts: Vec<InputPrevout> = self.input_prevouts(psbt)?;
 
-            if !all_taproot {
-                for (input, txin) in inputs {
-                    if input.non_witness_utxo.is_none() {
-                        return Err(SignerError::MissingNonWitnessUtxo);
-                    }
-                    if validated_non_witness_prevout(input, txin.previous_output).is_none() {
-                        return Err(SignerError::InvalidNonWitnessUtxo);
+        // A Taproot sighash commits to every prevout amount, so a tampered `witness_utxo` cannot
+        // trick us into overpaying fees. Any other input type needs the full previous transaction,
+        // and the exemption only applies if we can verify that all inputs are Taproot.
+        let all_taproot = prevouts.iter().all(InputPrevout::is_verified_p2tr);
+        if !sign_options.trust_witness_utxo && !all_taproot {
+            for ((input, txin), prevout) in psbt
+                .inputs
+                .iter()
+                .zip(psbt.unsigned_tx.input.iter())
+                .zip(prevouts.iter())
+            {
+                match prevout {
+                    // The input's own `non_witness_utxo` was already validated while resolving
+                    // this prevout.
+                    InputPrevout::NonWitness(_, _) => {}
+                    // No `non_witness_utxo` was available at all.
+                    InputPrevout::Witness(_) => return Err(SignerError::MissingNonWitnessUtxo),
+                    // Resolved from the wallet's tx graph, which never consults the PSBT's own
+                    // `non_witness_utxo` — it still needs an independent presence/validity check.
+                    InputPrevout::TxGraph(_, _) => {
+                        if input.non_witness_utxo.is_none() {
+                            return Err(SignerError::MissingNonWitnessUtxo);
+                        }
+                        if validated_non_witness_prevout(input, txin.previous_output).is_none() {
+                            return Err(SignerError::InvalidNonWitnessUtxo);
+                        }
                     }
                 }
             }
@@ -1912,27 +1927,27 @@ impl Wallet {
 
         // If the user hasn't explicitly opted-in, refuse to sign the transaction unless every input
         // is using `SIGHASH_ALL` or `SIGHASH_DEFAULT` for Taproot.
-        if !sign_options.allow_all_sighashes
-            && !psbt.inputs.iter().all(|i| match i.sighash_type {
-                None => true,
-                Some(sighash_type) => {
-                    let is_taproot = i
-                        .witness_utxo
-                        .as_ref()
-                        .map(|utxo| utxo.script_pubkey.is_p2tr())
-                        .unwrap_or(false);
-                    if is_taproot {
+        if !sign_options.allow_all_sighashes {
+            let uses_sighash_all = |(input, prevout): (&psbt::Input, &InputPrevout)| {
+                input.sighash_type.is_none_or(|sighash_type| {
+                    if prevout.is_p2tr() {
                         matches!(
                             sighash_type.taproot_hash_ty(),
-                            Ok(TapSighashType::All) | Ok(TapSighashType::Default)
+                            Ok(TapSighashType::All | TapSighashType::Default)
                         )
                     } else {
                         matches!(sighash_type.ecdsa_hash_ty(), Ok(EcdsaSighashType::All))
                     }
-                }
-            })
-        {
-            return Err(SignerError::NonStandardSighash);
+                })
+            };
+            if !psbt
+                .inputs
+                .iter()
+                .zip(prevouts.iter())
+                .all(uses_sighash_all)
+            {
+                return Err(SignerError::NonStandardSighash);
+            }
         }
 
         for signer in signers.iter().flat_map(|container| container.signers()) {
@@ -1947,18 +1962,25 @@ impl Wallet {
         }
     }
 
-    /// Whether this outpoint is a verified p2tr.
-    ///
-    /// `witness_utxo` scriptPubKey is unauthenticated; trusting it would skip the prev-tx check.
-    fn is_verified_taproot_input(&self, input: &psbt::Input, outpoint: OutPoint) -> bool {
-        if let Some(prev_tx) = self.tx_graph.graph().get_tx(outpoint.txid) {
-            return prev_tx
-                .output
-                .get(outpoint.vout as usize)
-                .is_some_and(|prevout| prevout.script_pubkey.is_p2tr());
+    /// Get validated input prevouts
+    fn input_prevouts<'a>(&self, psbt: &'a Psbt) -> Result<Vec<InputPrevout<'a>>, SignerError> {
+        if psbt.unsigned_tx.input.len() != psbt.inputs.len() {
+            return Err(IndexOutOfBoundsError::new(
+                psbt.unsigned_tx.input.len(),
+                psbt.inputs.len(),
+            )
+            .into());
         }
-        validated_non_witness_prevout(input, outpoint)
-            .is_some_and(|prevout| prevout.script_pubkey.is_p2tr())
+        psbt.unsigned_tx
+            .input
+            .iter()
+            .zip(psbt.inputs.iter())
+            .map(|(txin, input)| {
+                let outpoint = txin.previous_output;
+                let prev_tx = self.tx_graph().get_tx(outpoint.txid);
+                Ok(InputPrevout::new(prev_tx, txin, input)?)
+            })
+            .collect()
     }
 
     /// Return the spending policies for the wallet's descriptor.
