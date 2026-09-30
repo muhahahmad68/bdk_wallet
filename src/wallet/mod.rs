@@ -1976,6 +1976,15 @@ impl Wallet {
             .iter()
             .zip(psbt.inputs.iter())
             .map(|(txin, input)| {
+                // Skip already finalized inputs
+                if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
+                    return Ok(InputPrevout::Witness(
+                        input
+                            .witness_utxo
+                            .as_ref()
+                            .ok_or(SignerError::MissingWitnessUtxo)?,
+                    ));
+                }
                 let outpoint = txin.previous_output;
                 let prev_tx = self.tx_graph().get_tx(outpoint.txid);
                 Ok(InputPrevout::new(prev_tx, txin, input)?)
