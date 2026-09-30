@@ -173,6 +173,15 @@ impl<'a> InputPrevout<'a> {
             if !agrees_with_claim(&prev_tx.output[vout]) {
                 return Err(PrevoutError::Mismatch);
             }
+            // Also check non-witness utxo against graph if present
+            if let Some(non_witness_utxo) = &input.non_witness_utxo {
+                if non_witness_utxo.compute_txid() != outpoint.txid {
+                    return Err(PrevoutError::Invalid);
+                }
+                if non_witness_utxo.output.get(vout) != Some(&prev_tx.output[vout]) {
+                    return Err(PrevoutError::Mismatch);
+                }
+            }
             return Ok(Self::TxGraph(prev_tx, vout));
         }
 
